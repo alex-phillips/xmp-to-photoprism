@@ -9,6 +9,7 @@ from pathlib import Path
 import subprocess
 import requests
 import getpass
+import re
 from math import sin, cos, sqrt, atan2, radians
 
 TOKEN = None
@@ -46,7 +47,7 @@ class ExifTool(object):
         return output[: -len(self.sentinel)]
 
     def get_metadata(self, *filenames):
-        return json.loads(self.execute("-G", "-j", "-n", *filenames))
+        return json.loads(self.execute("-G1", "-j", "-a", *filenames))
 
 def login(username: str, password: str):
     response = requests.post(f'{HOST}/api/v1/session', json={
@@ -78,31 +79,19 @@ def geotag_photo(photo, exif, photo_id: str, force=False):
     lat = None
     lon = None
 
-    # if 'GPS:GPSLatitude' in exif:
-    #     lat_ref = exif['GPS:GPSLatitudeRef'] if 'GPS:GPSLatitudeRef' in exif else 'N'
-    #     lat = extract_coordinates(exif['GPS:GPSLatitude'])
-    #     if lat is not None:
-    #         if lat_ref.upper() == 'S':
-    #             lat = lat * -1.0
-
-    # if 'GPS:GPSLongitude' in exif:
-    #     lat_ref = exif['GPS:GPSLongitudeRef'] if 'GPS:GPSLongitudeRef' in exif else 'E'
-    #     lon = extract_coordinates(exif['GPS:GPSLongitude'])
-    #     if lon is not None:
-    #         if lat_ref.upper() == 'W':
-    #             lon = lon * -1.0
-
-    if 'XMP:GPSLatitude' in exif:
-        lat = extract_coordinates(exif['XMP:GPSLatitude'])
-
-    if 'XMP:GPSLongitude' in exif:
-        lon = extract_coordinates(exif['XMP:GPSLongitude'])
-
     if 'XMP-exif:GPSLatitude' in exif:
+        lat_ref = exif['XMP-exif:GPSLatitudeRef'] if 'XMP-exif:GPSLatitudeRef' in exif else 'N'
         lat = extract_coordinates(exif['XMP-exif:GPSLatitude'])
+        if lat is not None:
+            if lat_ref.upper() == 'S':
+                lat = lat * -1.0
 
     if 'XMP-exif:GPSLongitude' in exif:
+        lat_ref = exif['XMP-exif:GPSLongitudeRef'] if 'XMP-exif:GPSLongitudeRef' in exif else 'E'
         lon = extract_coordinates(exif['XMP-exif:GPSLongitude'])
+        if lon is not None:
+            if lat_ref.upper() == 'W':
+                lon = lon * -1.0
 
     if photo['Lat'] == lat and photo['Lng'] == lon:
         return
@@ -147,6 +136,11 @@ def add_label(id: str, tag: str):
 def extract_coordinates(value):
     if type(value) == int or type(value) == float:
         return value
+    r = re.search(r'^([0-9.]+) deg ([0-9.]+)\' ([0-9.]+)"', value)
+    if r is not None:
+        return float(r.groups()[0]) + (float(r.groups()[1]) / 60) + (float(r.groups()[2]) / 3600)
+
+    return false
 
 def process_file(fname, args):
     image_path, extension = os.path.splitext(fname)
@@ -183,11 +177,17 @@ def process_file(fname, args):
         geotag_photo(photo, exif, photo_id, args.force)
 
     if args.geo_only == False:
-        if 'XMP:TagsList' in exif:
-            if isinstance(exif['XMP:TagsList'], str):
-                exif['XMP:TagsList'] = [exif['XMP:TagsList']]
+        tags = []
+        if 'XMP-digiKam:TagsList' in exif:
+            tags = exif['XMP-digiKam:TagsList']
+        elif 'XMP:TagsList' in exif:
+            tags = exif['XMP:TagsList']
 
-            for tag in exif['XMP:TagsList']:
+        if isinstance(tags, str):
+            tags = [tags]
+
+        if len(tags) > 0:
+            for tag in tags:
                 tags = list(set(tag.split('/')))
                 if args.nested_labels == False:
                     tags = [tags.pop()]
