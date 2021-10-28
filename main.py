@@ -14,6 +14,8 @@ from math import sin, cos, sqrt, atan2, radians
 
 TOKEN = None
 HOST = None
+ALBUMS = None
+PHOTOS_TO_ALBUMS = {}
 
 # exiftool usage from here: https://stackoverflow.com/questions/10075115/call-exiftool-from-a-python-script
 class ExifTool(object):
@@ -47,7 +49,7 @@ class ExifTool(object):
         return output[: -len(self.sentinel)]
 
     def get_metadata(self, *filenames):
-        return json.loads(self.execute("-G1", "-j", "-a", *filenames))
+        return json.loads(self.execute("-G2", "-j", "-a", *filenames))
 
 def login(username: str, password: str):
     response = requests.post(f'{HOST}/api/v1/session', json={
@@ -79,18 +81,18 @@ def geotag_photo(photo, exif, photo_id: str, force=False):
     lat = None
     lon = None
 
-    if 'XMP-exif:GPSLatitude' in exif:
-        lat_ref = exif['XMP-exif:GPSLatitudeRef'] if 'XMP-exif:GPSLatitudeRef' in exif else 'N'
-        lat = extract_coordinates(exif['XMP-exif:GPSLatitude'])
+    if 'Location:GPSLatitude' in exif:
+        lat_ref = exif['Location:GPSLatitudeRef'] if 'Location:GPSLatitudeRef' in exif else 'N'
+        lat = extract_coordinates(exif['Location:GPSLatitude'])
         if lat is not None:
-            if lat_ref.upper() == 'S':
+            if lat_ref[0].upper() == 'S':
                 lat = lat * -1.0
 
-    if 'XMP-exif:GPSLongitude' in exif:
-        lat_ref = exif['XMP-exif:GPSLongitudeRef'] if 'XMP-exif:GPSLongitudeRef' in exif else 'E'
-        lon = extract_coordinates(exif['XMP-exif:GPSLongitude'])
+    if 'Location:GPSLongitude' in exif:
+        lat_ref = exif['Location:GPSLongitudeRef'] if 'Location:GPSLongitudeRef' in exif else 'E'
+        lon = extract_coordinates(exif['Location:GPSLongitude'])
         if lon is not None:
-            if lat_ref.upper() == 'W':
+            if lat_ref[0].upper() == 'W':
                 lon = lon * -1.0
 
     if photo['Lat'] == lat and photo['Lng'] == lon:
@@ -133,6 +135,44 @@ def add_label(id: str, tag: str):
         'Priority': 10,
     }).json()
 
+def get_albums(retval = [], offset = 0):
+    response = requests.get(f'{HOST}/api/v1/albums', headers={
+        'x-session-id': TOKEN,
+    }, params={
+        "count": 1000,
+        "offset": offset,
+        "q": "",
+        "category": "",
+        "type": "album",
+    }).json()
+
+    retval = retval + response
+    if len(response) != 0:
+        return get_albums(retval, len(response))
+
+    return retval
+
+def create_album(name):
+    print(f"  Creating album {name}")
+    response = requests.post(f'{HOST}/api/v1/albums', headers={
+        'x-session-id': TOKEN,
+    }, json={
+        'Title': name,
+        'Favorite': False,
+    }).json()
+
+    global ALBUMS
+    ALBUMS = ALBUMS + [response]
+
+    return response
+
+def add_photos_to_album(album_id, photos):
+    return requests.post(f'{HOST}/api/v1/albums/{album_id}/photos', headers={
+        'x-session-id': TOKEN,
+    }, json={
+        'photos': photos,
+    }).json()
+
 def extract_coordinates(value):
     if type(value) == int or type(value) == float:
         return value
@@ -140,30 +180,59 @@ def extract_coordinates(value):
     if r is not None:
         return float(r.groups()[0]) + (float(r.groups()[1]) / 60) + (float(r.groups()[2]) / 3600)
 
-    return false
+    return None
+
+def get_photo(filepath):
+    try:
+        file_hash = get_file_sha1(filepath)
+        existing_photo = requests.get(f'{HOST}/api/v1/files/{file_hash}', headers={
+            'x-session-id': TOKEN,
+        }).json()
+
+        photo_id = existing_photo['PhotoUID']
+        photo = requests.get(f'{HOST}/api/v1/photos/{photo_id}', headers={
+            'x-session-id': TOKEN,
+        }).json()
+
+        return photo
+    except:
+        # photo likely doesn't exist in photoprism
+        return None
 
 def process_file(fname, args):
     image_path, extension = os.path.splitext(fname)
 
     # only process XMP sidecars
     if extension.lower() != '.xmp':
+        # manually add specified labels to found photos
+        if args.labels is not None:
+            photo = get_photo(fname)
+            if photo is None:
+                return
+
+            print(f"Processing {fname}")
+
+            photo_id = photo['UID']
+
+            for label in args.labels.split(','):
+                found = False
+                for existing_label in photo['Labels']:
+                    if existing_label['Label']['Name'].lower() == label.lower():
+                        found = True
+                        break
+                if found == False:
+                    print(f'  Adding tag: {label}')
+                    add_label(photo_id, label)
+
         return
 
     if not os.path.isfile(image_path):
         return
 
-    file_hash = get_file_sha1(image_path)
-    existing_photo = requests.get(f'{HOST}/api/v1/files/{file_hash}', headers={
-        'x-session-id': TOKEN,
-    }).json()
+    photo = get_photo(image_path)
+    photo_id = photo['UID']
 
-    photo_id = existing_photo['PhotoUID']
-    photo = requests.get(f'{HOST}/api/v1/photos/{photo_id}', headers={
-        'x-session-id': TOKEN,
-    }).json()
-
-    filename = os.path.basename(fname)
-    print(f"Processing {fname} (hash: {file_hash})")
+    print(f"Processing {fname}")
 
     # safeguard, don't touch files that are too new
     mtime = os.path.getmtime(fname)
@@ -178,30 +247,57 @@ def process_file(fname, args):
 
     if args.geo_only == False:
         tags = []
-        if 'XMP-digiKam:TagsList' in exif:
-            tags = exif['XMP-digiKam:TagsList']
-        elif 'XMP:TagsList' in exif:
-            tags = exif['XMP:TagsList']
+        if 'Image:TagsList' in exif:
+            tags = exif['Image:TagsList']
+        elif 'Image:TagsList' in exif:
+            tags = exif['Image:TagsList']
 
         if isinstance(tags, str):
             tags = [tags]
 
         if len(tags) > 0:
             for tag in tags:
-                tags = list(set(tag.split('/')))
-                if args.nested_labels == False:
-                    tags = [tags.pop()]
+                nested_tags = tag.split('/')
 
-                for tag in tags:
+                if nested_tags[0] == 'Albums':
+                    if len(nested_tags) == 1:
+                        continue
+
+                    album_name = nested_tags[1]
+
+                    global ALBUMS
+                    if ALBUMS is None:
+                        ALBUMS = get_albums()
+
+                    album_id = None
+                    for album in ALBUMS:
+                        if album['Title'] == album_name:
+                            album_id = album['UID']
+                            break
+
+                    if album_id is None:
+                        album = create_album(album_name)
+                        album_id = album['UID']
+
+                    if album_id not in PHOTOS_TO_ALBUMS:
+                        PHOTOS_TO_ALBUMS[album_id] = []
+
+                    PHOTOS_TO_ALBUMS[album_id].append(photo_id)
+                    continue
+
+                if args.nested_labels == False:
+                    nested_tags = [nested_tags.pop()]
+
+                for nested_tag in nested_tags:
                     # check if it already exists
                     found = False
                     for existing_label in photo['Labels']:
-                        if existing_label['Label']['Name'].lower() == tag.lower():
+                        if existing_label['Label']['Name'].lower() == nested_tag.lower():
                             found = True
                             break
                     if found == False or args.force == True:
-                        print(f'  Adding tag: {tag}')
-                        add_label(photo_id, tag.strip())
+                        print(f'  Adding tag: {nested_tag}')
+                        add_label(photo_id, nested_tag.strip())
 
 parser = argparse.ArgumentParser(description="Update Photoprism metadata with tags and GPS from XMP sidecars")
 parser.add_argument("source", help="Source to scan for files", nargs="+")
@@ -222,6 +318,9 @@ parser.add_argument(
 )
 parser.add_argument(
     "--labels-only", help="Only add labels", action="store_true"
+)
+parser.add_argument(
+    "--labels", help="Only add labels"
 )
 parser.add_argument(
     "--force", help="Force update of all metadata", action="store_true"
@@ -259,3 +358,8 @@ with ExifTool() as e:
                 for filename in files:
                     fname = os.path.join(dirpath, filename)
                     process_file(fname, args)
+
+for album_id, photos in PHOTOS_TO_ALBUMS.items():
+    if len(photos) > 0:
+        print(f"Adding {len(photos)} to album {album_id}")
+        add_photos_to_album(album_id, photos)
