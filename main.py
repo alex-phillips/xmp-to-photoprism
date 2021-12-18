@@ -173,6 +173,13 @@ def add_photos_to_album(album_id, photos):
         'photos': photos,
     }).json()
 
+def set_private(photos):
+    return requests.post(f'{HOST}/api/v1/batch/photos/private', headers={
+        'x-session-id': TOKEN,
+    }, json={
+        'photos': photos,
+    }).json()
+
 def extract_coordinates(value):
     if type(value) == int or type(value) == float:
         return value
@@ -256,10 +263,11 @@ def process_file(fname, args):
             tags = [tags]
 
         if len(tags) > 0:
+            private = False
             for tag in tags:
                 nested_tags = tag.split('/')
 
-                if nested_tags[0] == 'Albums':
+                if nested_tags[0] == 'Albums' and args.skip_albums == False:
                     if len(nested_tags) == 1:
                         continue
 
@@ -289,6 +297,11 @@ def process_file(fname, args):
                     nested_tags = [nested_tags.pop()]
 
                 for nested_tag in nested_tags:
+                    # set private based on tag
+                    if nested_tag == args.private_tag:
+                        private = True
+                        continue
+
                     # check if it already exists
                     found = False
                     for existing_label in photo['Labels']:
@@ -298,6 +311,10 @@ def process_file(fname, args):
                     if found == False or args.force == True:
                         print(f'  Adding tag: {nested_tag}')
                         add_label(photo_id, nested_tag.strip())
+
+            if private != photo['Private']:
+                print(f"  Toggling photo's private property")
+                set_private([photo_id])
 
 parser = argparse.ArgumentParser(description="Update Photoprism metadata with tags and GPS from XMP sidecars")
 parser.add_argument("source", help="Source to scan for files", nargs="+")
@@ -327,6 +344,12 @@ parser.add_argument(
 )
 parser.add_argument(
     "--nested-labels", help="Apply all nested labels", action="store_true"
+)
+parser.add_argument(
+    "--private-tag", help="Set all photos to private with the specified tag", default="private"
+)
+parser.add_argument(
+    "--skip-albums", help="Don't process 'album' tags as albums", action="store_true"
 )
 
 args = parser.parse_args()
